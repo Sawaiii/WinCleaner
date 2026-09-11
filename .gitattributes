@@ -1,0 +1,5 @@
+# Windows-скрипты должны оставаться с CRLF и в ZIP-архиве с GitHub
+*.cmd text eol=crlf
+*.ps1 text eol=crlf
+*.png binary
+*.ico binary
