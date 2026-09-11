@@ -22,8 +22,8 @@ using Microsoft.Win32;
 [assembly: AssemblyTitle("WinCleaner")]
 [assembly: AssemblyDescription("Очистка Windows от временных файлов и кэшей")]
 [assembly: AssemblyProduct("WinCleaner")]
-[assembly: AssemblyVersion("1.0.0.0")]
-[assembly: AssemblyFileVersion("1.0.0.0")]
+[assembly: AssemblyVersion("1.1.0.0")]
+[assembly: AssemblyFileVersion("1.1.0.0")]
 
 namespace WinCleaner
 {
@@ -60,6 +60,7 @@ namespace WinCleaner
         public string[] Local = new string[0];
         public string[] Roaming = new string[0];
         public bool Firefox;
+        public bool NeverKill;              // даже фоновый процесс не завершаем (Steam: может идти игра или загрузка)
     }
 
     sealed class CleanItem
@@ -109,7 +110,13 @@ namespace WinCleaner
                     try { a = fsi.Attributes; } catch { continue; }
                     if ((a & FileAttributes.ReparsePoint) != 0) continue;
                     var sub = fsi as DirectoryInfo;
-                    if (sub != null) { dirs.Add(sub); stack.Push(sub); continue; }
+                    if (sub != null)
+                    {
+                        if (IsProtectedDir(sub.FullName)) continue;
+                        dirs.Add(sub);
+                        stack.Push(sub);
+                        continue;
+                    }
                     var f = (FileInfo)fsi;
                     if (keep != null && keep.Contains(f.Name, StringComparer.OrdinalIgnoreCase)) continue;
                     freed += DeleteFile(f, cutoff, c.DryRun);
@@ -130,10 +137,42 @@ namespace WinCleaner
             return freed;
         }
 
+        // Файлы и папки, на которые ссылаются ярлыки панели задач, «Пуска» и рабочего стола (см. Pins).
+        // Их не удаляем никогда, даже если они лежат во временной папке. Наборы заменяются целиком.
+        static HashSet<string> protFiles = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        static HashSet<string> protDirs = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+
+        public static void SetProtected(IEnumerable<string> paths)
+        {
+            var files = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            var dirs = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            foreach (var raw in paths)
+            {
+                string p;
+                try
+                {
+                    p = Environment.ExpandEnvironmentVariables(raw.Trim().Trim('"'));
+                    if (!Path.IsPathRooted(p)) continue;
+                    p = Path.GetFullPath(p).TrimEnd('\\');
+                }
+                catch { continue; }
+                if (Directory.Exists(p)) { dirs.Add(p); continue; }
+                files.Add(p);
+                string parent = Path.GetDirectoryName(p);
+                if (!string.IsNullOrEmpty(parent)) dirs.Add(parent.TrimEnd('\\'));
+            }
+            protFiles = files;
+            protDirs = dirs;
+        }
+
+        static bool IsProtectedFile(string p) { var s = protFiles; return s.Count > 0 && s.Contains(p); }
+        static bool IsProtectedDir(string p) { var s = protDirs; return s.Count > 0 && s.Contains(p.TrimEnd('\\')); }
+
         static long DeleteFile(FileInfo f, DateTime cutoff, bool dry)
         {
             try
             {
+                if (IsProtectedFile(f.FullName)) return 0;
                 if (f.LastWriteTime > cutoff || f.CreationTime > cutoff) return 0;
                 long len = f.Length;
                 if (!dry)
@@ -415,13 +454,85 @@ namespace WinCleaner
             return l.Count > 0;
         }
 
-        // Сначала вежливо (как крестик окна), через 8 секунд — принудительно.
-        public static void Close(AppDef a)
+        public static bool HasWindow(AppDef a)
         {
-            foreach (var p in Find(a)) using (p) { try { p.CloseMainWindow(); } catch { } }
-            for (int i = 0; i < 16 && IsRunning(a); i++) Thread.Sleep(500);
+            bool any = false;
+            foreach (var p in Find(a))
+            {
+                try { if (p.MainWindowHandle != IntPtr.Zero) any = true; } catch { }
+                p.Dispose();
+            }
+            return any;
+        }
+
+        // Завершает только фоновые процессы без окон (например, Edge с «ускорением запуска») — сессия
+        // браузера к этому моменту уже сохранена. Окна не закрываем никогда: если закрывать их по одному,
+        // браузер запомнит только последнее окно и остальные окна с закреплёнными вкладками пропадут.
+        public static bool KillBackground(AppDef a)
+        {
+            if (a.NeverKill || HasWindow(a)) return false;
             foreach (var p in Find(a)) using (p) { try { p.Kill(); } catch { } }
             Thread.Sleep(700);
+            return true;
+        }
+    }
+
+    // Ярлыки на панели задач, в «Пуске» и на рабочем столе всех пользователей: всё, на что они
+    // указывают (программа, значок, рабочая папка), попадает в защищённый список Fs.
+    static class Pins
+    {
+        public static int Load(List<string> users)
+        {
+            var lnks = new List<string>();
+            string pd = Environment.GetFolderPath(Environment.SpecialFolder.CommonApplicationData);
+            foreach (var u in users)
+            {
+                Collect(lnks, Path.Combine(u, @"AppData\Roaming\Microsoft\Internet Explorer\Quick Launch"), 4);
+                Collect(lnks, Path.Combine(u, @"AppData\Roaming\Microsoft\Windows\Start Menu"), 6);
+                Collect(lnks, Path.Combine(u, "Desktop"), 0);
+                Collect(lnks, Path.Combine(u, @"OneDrive\Desktop"), 0);
+            }
+            Collect(lnks, Path.Combine(pd, @"Microsoft\Windows\Start Menu"), 6);
+            Collect(lnks, Environment.GetFolderPath(Environment.SpecialFolder.CommonDesktopDirectory), 0);
+            Collect(lnks, Environment.GetFolderPath(Environment.SpecialFolder.DesktopDirectory), 0);
+            lnks = lnks.Distinct(StringComparer.OrdinalIgnoreCase).ToList();
+
+            var paths = new List<string>();
+            object shell = null;
+            try { shell = Activator.CreateInstance(Type.GetTypeFromProgID("WScript.Shell")); } catch { }
+            if (shell != null)
+            {
+                foreach (var l in lnks)
+                {
+                    try
+                    {
+                        object sc = shell.GetType().InvokeMember("CreateShortcut", BindingFlags.InvokeMethod, null, shell, new object[] { l });
+                        paths.Add(Prop(sc, "TargetPath"));
+                        paths.Add(Prop(sc, "WorkingDirectory"));
+                        string icon = Prop(sc, "IconLocation");
+                        int comma = icon.LastIndexOf(',');
+                        paths.Add(comma > 0 ? icon.Substring(0, comma) : icon);
+                        Marshal.ReleaseComObject(sc);
+                    }
+                    catch { }
+                }
+                Marshal.ReleaseComObject(shell);
+            }
+            Fs.SetProtected(paths.Where(p => !string.IsNullOrEmpty(p)));
+            return lnks.Count;
+        }
+
+        static string Prop(object o, string name)
+        {
+            return (o.GetType().InvokeMember(name, BindingFlags.GetProperty, null, o, null) as string) ?? "";
+        }
+
+        static void Collect(List<string> res, string dir, int depth)
+        {
+            if (string.IsNullOrEmpty(dir) || !Directory.Exists(dir)) return;
+            try { res.AddRange(Directory.GetFiles(dir, "*.lnk")); } catch { }
+            if (depth <= 0) return;
+            foreach (var d in Fs.SubDirs(dir)) Collect(res, d, depth - 1);
         }
     }
 
@@ -454,7 +565,7 @@ namespace WinCleaner
             new AppDef { Name = "Discord", Procs = new[] { "Discord" }, Roaming = new[] { "discord" } },
             new AppDef { Name = "Slack", Procs = new[] { "slack" }, Roaming = new[] { "Slack" } },
             new AppDef { Name = "Microsoft Teams", Procs = new[] { "Teams" }, Roaming = new[] { @"Microsoft\Teams" } },
-            new AppDef { Name = "Steam", Procs = new[] { "steam", "steamwebhelper" }, Local = new[] { @"Steam\htmlcache" } },
+            new AppDef { Name = "Steam", Procs = new[] { "steam", "steamwebhelper" }, NeverKill = true, Local = new[] { @"Steam\htmlcache" } },
         };
 
         static IEnumerable<string> Roots(AppDef a, string user)
@@ -501,7 +612,8 @@ namespace WinCleaner
                     if (a.Firefox)
                     {
                         foreach (var p in Fs.SubDirs(Path.Combine(u, @"AppData\Local\Mozilla\Firefox\Profiles")))
-                            foreach (var n in new[] { "cache2", "startupCache", "thumbnails", "jumpListCache" })
+                            // thumbnails (картинки плиток новой вкладки) и jumpListCache (значки меню на панели задач) не трогаем
+                            foreach (var n in new[] { "cache2", "startupCache" })
                                 s += Fs.ClearDir(c, Path.Combine(p, n));
                     }
                     else
@@ -549,7 +661,7 @@ namespace WinCleaner
             L.Add(new CleanItem
             {
                 Title = "Кэш браузеров",
-                Description = "Chrome, Edge, Яндекс, Opera, Brave, Vivaldi, Firefox. Удаляется только кэш: пароли, история, закладки, cookies и вкладки остаются. Если браузер открыт, программа предложит его закрыть.",
+                Description = "Chrome, Edge, Яндекс, Opera, Brave, Vivaldi, Firefox. Удаляется только кэш. Закладки и панель закладок, закреплённые вкладки, табло и экспресс-панель, пароли, история и cookies остаются. Открытый браузер программа не закрывает — попросит закрыть его самостоятельно.",
                 Apps = Browsers,
                 Run = c => ClearApps(c, Browsers)
             });
@@ -970,7 +1082,7 @@ namespace WinCleaner
             });
             header.Controls.Add(new Label
             {
-                Text = "Отметьте, что удалить, и нажмите «Очистить». Документы, фото, загрузки, пароли и история браузеров не затрагиваются.",
+                Text = "Отметьте, что удалить, и нажмите «Очистить». Не затрагиваются: документы, фото, загрузки, пароли, закладки, закреплённые вкладки и значки на панели задач.",
                 ForeColor = Muted,
                 Location = new Point(S(20), S(50)),
                 Size = new Size(S(740), S(40)),
@@ -1269,6 +1381,8 @@ namespace WinCleaner
             UpdateTotal();
             RunBackground(() =>
             {
+                int pins = Pins.Load(Catalog.Users);
+                ctx.Log("Ярлыков на панели задач, в «Пуске» и на рабочем столе: " + pins + " — их файлы защищены от удаления");
                 int i = 0;
                 foreach (var it in items)
                 {
@@ -1319,19 +1433,25 @@ namespace WinCleaner
                         MessageBoxDefaultButton.Button2) != DialogResult.Yes) return;
             }
 
-            var running = sel.Where(x => x.Apps != null).SelectMany(x => x.Apps)
-                             .Where(a => AppControl.IsRunning(a)).ToList();
-            bool closeApps = false;
-            if (running.Count > 0)
+            // Открытые окна программ не закрываем сами — только просим пользователя (см. AppControl.KillBackground).
+            var apps = sel.Where(x => x.Apps != null).SelectMany(x => x.Apps).ToList();
+            var background = new List<AppDef>();
+            string nl = Environment.NewLine;
+            while (true)
             {
+                var running = apps.Where(a => AppControl.IsRunning(a)).ToList();
+                var windowed = running.Where(a => a.NeverKill || AppControl.HasWindow(a)).ToList();
+                if (windowed.Count == 0) { background = running; break; }
                 var r = MessageBox.Show(this,
-                    "Сейчас открыты: " + string.Join(", ", running.Select(a => a.Name)) + "." + Environment.NewLine + Environment.NewLine +
-                    "Пока программа открыта, её кэш почистить нельзя." + Environment.NewLine + Environment.NewLine +
-                    "Да — закрыть их сейчас (браузеры восстановят вкладки при следующем запуске)" + Environment.NewLine +
-                    "Нет — не закрывать и пропустить их кэш",
-                    "Открытые программы", MessageBoxButtons.YesNoCancel, MessageBoxIcon.Question);
-                if (r == DialogResult.Cancel) return;
-                closeApps = r == DialogResult.Yes;
+                    "Сейчас открыты: " + string.Join(", ", windowed.Select(a => a.Name)) + "." + nl + nl +
+                    "Чтобы почистить их кэш, закройте их сами. Браузер закрывайте через меню → «Выход»: " +
+                    "так он сохранит все окна и закреплённые вкладки. Сама программа окна не закрывает." + nl + nl +
+                    "Повторить — я закрыл, проверить ещё раз" + nl +
+                    "Пропустить — очистить остальное, а кэш этих программ не трогать" + nl +
+                    "Прервать — отменить очистку",
+                    "Открытые программы", MessageBoxButtons.AbortRetryIgnore, MessageBoxIcon.Information);
+                if (r == DialogResult.Abort) return;
+                if (r == DialogResult.Ignore) break;
             }
 
             var ctx = NewCtx(false);
@@ -1342,11 +1462,9 @@ namespace WinCleaner
             AppendLog("Начинаю очистку…");
             RunBackground(() =>
             {
-                if (closeApps)
-                {
-                    Ui(() => status.Text = "Закрываю программы…");
-                    foreach (var a in running) AppControl.Close(a);
-                }
+                Pins.Load(Catalog.Users);
+                foreach (var a in background)
+                    if (AppControl.KillBackground(a)) ctx.Log(a.Name + " работал в фоне без окон — фоновый процесс завершён");
                 int i = 0;
                 foreach (var it in sel)
                 {
